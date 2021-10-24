@@ -127,3 +127,13 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# IDEs
+
+.vscode
+.idea
+
+# Temp files
+
+_tmp
+_build

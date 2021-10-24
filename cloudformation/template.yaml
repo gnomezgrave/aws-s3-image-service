@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: API to serve images from an S3 bucket
+
+Parameters:
+  LogLevel:
+    Type: String
+    Description: LogLevel to be used for the components
+  OriginalImagesPrefix:
+    Type: String
+    Description: S3 prefix for the root of the otiginal images.
+  Environment:
+    Type: String
+    Description: Environment on which the API runs
+    Default: dev
+
+Resources:
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-images-bucket"
+
+  APILambda:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - APILambdaRole
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-lambda"
+      Handler: app.handler
+      Description: Handles API requests
+      Role: !GetAtt APILambdaRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+      MemorySize: 1536
+      CodeUri: ../_build/
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !Ref LogLevel
+          IMAGES_BUCKET: !Ref ImagesBucket
+          IMAGES_PREFIX: !Ref OriginalImagesPrefix
+          MAX_IMAGE_WIDTH: 2000 # To comply to the maximum size of the Lambda and API gateway response
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub
+        - ${StackName}-api
+        - { StackName: !Ref "AWS::StackName" }
+      Description: Rest API for the Image Service
+      BinaryMediaTypes:
+        - "*/*"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      ApiKeySourceType: HEADER
+
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn:
+      - RestApi
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt
+        - RestApi
+        - RootResourceId
+      PathPart: '{proxy+}'
+
+  ProxyResourceANY:
+    Type: AWS::ApiGateway::Method
+    DependsOn:
+      - ProxyResource
+      - ApiGatewayIamRole
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.proxy: true
+      MethodResponses:
+        - StatusCode: 200
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        ContentHandling: CONVERT_TO_TEXT
+        PassthroughBehavior: WHEN_NO_MATCH
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APILambda.Arn}/invocations"
+        Credentials: !GetAtt ApiGatewayIamRole.Arn
+
+  ## TODO: We can have different stages deployed for different users to have separate API keys
+  RestAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ProxyResourceANY
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: !Ref Environment
+
+  ## Start of API Keys related segment
+  APISecretKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: API key definition for Imaginary API
+      Name: !Sub
+        - ${StackName}--api-key
+        - { StackName: !Ref "AWS::StackName" }
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: "api_key"
+        PasswordLength: 30
+        ExcludeCharacters: '!"#$%&()*+,-./:;<=>?@[\]^_`{|}~'
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn:
+      - RestAPIDeployment
+      - APISecretKey
+    Properties:
+      Description: API Key for Imaginary API
+      Enabled: 'true'
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: !Ref Environment
+      Value: !Sub
+        - "{{resolve:secretsmanager:${SecretID}:SecretString:${SecretKey}}}"
+        - { SecretID: !Ref APISecretKey, SecretKey: "api_key" }
+
+  APIUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+      - RestAPIDeployment
+    Properties:
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: !Ref Environment
+      Description: Usage plan for the API with the Key
+      UsagePlanName: !Sub
+        - ${StackName}-usage-plan
+        - { StackName: !Ref "AWS::StackName" }
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  APIUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    DependsOn:
+      - APIUsagePlan
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref APIUsagePlan
+
+  ## End of API Key related segment
+
+  APILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}--log-group"
+      RetentionInDays: 60
+
+  ## IAM
+  #  Will be used to call the images bucket.
+  APILambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - ${StackName}--lambda-role
+        - { StackName: !Ref "AWS::StackName" }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+      - PolicyName: S3Policy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:Get*
+                - s3:List*
+              Resource:
+                - {"Fn::Sub": ["arn:aws:s3:::${ImagesBucket}", {"ImagesBucket": !Ref ImagesBucket}]}
+                - {"Fn::Sub": ["arn:aws:s3:::${ImagesBucket}/*", {"ImagesBucket": !Ref ImagesBucket}]}
+
+  APIInvoke:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - APILambda
+      - RestApi
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt APILambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub
+        - arn:aws:execute-api:${Region}:${AccountId}:${API}/${Env}
+        - {Region: !Ref AWS::Region, AccountId: !Ref AWS::AccountId, API: !Ref RestApi, Env: !Ref Environment}
+
+  ApiGatewayIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: 'Allow'
+            Principal:
+              Service:
+                - 'apigateway.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'lambda:*'
+                Resource: !GetAtt APILambda.Arn
+        - PolicyName: CloudwatchPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: cloudwatch:*
+                Resource: "*"
+        - PolicyName: CloudwatchLogsPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: logs:*
+                Resource: "*"
